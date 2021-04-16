@@ -1,0 +1,708 @@
+---
+title: "ML Zymoseptoria"
+output: html_notebook
+---
+
+## Fungal Pathogen Gene Selection for Predicting the Onset of Infection Using a Multi-Stage Machine Learning Approach 
+
+*Authors: Oliver Stoner, Graham Thomas, Fabrizio Costa, Ryan M Ames*
+
+Phytopathogenic fungi pose a serious threat to global food security. Next-generation sequencing technologies, such as transcriptomics, are increasingly used to profile infection, assess environmental adaptation and gauge host-responses. The accumulation of these large-scale data has created the opportunity to employ new computational methods to gain greater biological insights. Machine learning approaches that learn to identify patterns in complex datasets have recently been applied to the field of plant-pathogen interactions.  Here, we apply a machine learning approach to transcriptomics data for the fungal pathogen *Zymoseptoria tritici* to predict the onset of infection as measured by disease symptom development. We show that we can identify the most important genes that predict infection timings, accurately classify strains as early and late infectors and predict the timing of infection of 'novel' strains using only a subset of the data. These methods and the genes identified further demonstrate the use of these methods in the field of plant-pathogen interactions and have implications for the identification of biomarkers for disease monitoring and forecasting. 
+
+This R notebook provides all the code for the analysis presented in the accompanying publication.
+
+```{r setup} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+require("knitr")
+opts_knit$set(root.dir = ".")
+```
+
+### Setup 
+
+The following packages need to be installed and loaded
+```{r warning=FALSE}
+library(tidyverse)
+library(ranger)
+library(Rfast)
+library(corpcor)
+library(nimble)
+library(reshape2)
+library(abind)
+library(coda)
+```
+
+We next declare some functions used throughout the analysis.  The first function computes the piecewise linear splines.
+
+```{r}
+linear_spline <- nimbleFunction(run=function(x=double(1),knots=double(1),values=double(1)){
+  l=length(knots)
+  dx <- knots[2:l]-knots[1:(l-1)]
+  dy <- values[2:l]-values[1:(l-1)]
+  grad <- dy/dx
+  slopes <- c(values[1],grad[1],grad[2:(l-1)]-grad[1:(l-2)])
+  N <- length(x)
+  parts <- matrix(nrow=N,ncol=l)
+  parts[,1] <- rep(1,N)
+  out <- numeric(N)
+  for(t in 1:N){
+    for(k in 1:(l-1)){
+      parts[t,k+1] <- (x[t]>=knots[k])*(x[t]-knots[k])
+    }
+    out[t] <- sum(parts[t,]*slopes)
+  }
+  returnType(double(1))
+  return(out)
+})
+```
+
+The next function defines the parametric Bayesian model.
+
+```{r}
+fung_code <- nimbleCode({
+  for(s in 1:n_strains){
+    kappa[1,s] <- 0
+    kappa[2,s] ~ dunif(0,10)
+    kappa[3,s] ~ dunif(kappa[2,s],28)
+    kappa[4,s] <- 28
+    alpha[1,s] ~ dnorm(iota[1],sd=1)
+    alpha[2,s] <- alpha[1,s]
+    alpha[3,s] ~ dnorm(iota[2],sd=0.5)
+    alpha[4,s] ~ dnorm(iota[3],sd=0.5)
+    mu[1:28,s] <- linear_spline(1:28,kappa[1:4,s],alpha[1:4,s])
+  }
+  for(i in 1:n){
+    d[i] ~ dnorm(mu[time[i],strain[i]],sd=sigma)
+  }
+  for(j in 1:3){
+    iota[j] ~ dunif(0,10)
+  }
+  sigma ~ dnorm(0,sd=1)
+})
+```
+
+Finally, we include a function for generating initial parameter values for the MCMC.
+
+```{r}
+fung_inits_fun <- function(){list(kappa=matrix(rep(c(NA,runif(1,5,10),runif(1,10,20),NA),n_strains),ncol=n_strains),
+     alpha=rbind(runif(n_strains,0,2),NA,runif(n_strains,3,6),runif(n_strains,2,5)),
+     sigma=runif(1,0.5,2),iota=c(runif(1,0,2),runif(1,3,6),runif(1,2,5)))}
+```
+
+### Read in the data and do some initial preparation.
+
+```{r message=FALSE, warning=FALSE}
+#Create a data frame containing the information on infection outcomes.
+outcomes_data <- tibble(strain=c("3D1","3D7","1A5","1E4","Zt05","Zt09","Zt10"),
+                        necrosis_dpi=c(17,14,14,14,12,13,19),
+                        pycnidia_dpi=c(21,18,28,18,19,17,23),
+                        necrosis_level=c(2,5,5,5,5,5,4))
+
+#Read in the Haueisen data.
+data_hau <- read_delim('data/Haueisen_combined_data.txt',delim='\t')
+
+#Put it into long format and extract the variables (e.g. replicate).
+data_hau <- data_hau%>%melt(id='genes')%>%mutate(strain=sapply(as.character(variable),function(x)strsplit(x,'_')[[1]][1]),
+                                                 replicate=sapply(as.character(variable),function(x)strsplit(x,'_')[[1]][4]),
+                                                 time=sapply(as.character(variable),function(x)strsplit(x,'_')[[1]][3]))
+
+#Names of the Haueisen strains.
+hau_strains <- unique(data_hau$strain)
+
+#Names of the Haueisen genes.
+hau_genes <- unique(data_hau$genes)
+
+#Create a data frame containing the estimated observation times from the Haueisen data.
+hau_times <- tibble(strain=sort(rep(hau_strains,4)),
+                    time=rep(sort(c('A','B','C','D')),3),
+                    real_times=c(3,6.5,11.5,21.5,4.5,8.5,14.5,22.5,5.5,10.5,15,23))
+
+#Rename the 'gene_id' column to 'genes to match the Palma-Guerrero data.
+data_hau <- rename(data_hau,gene_id=genes)
+
+#Read in the Palma-Guerrero data.
+data_pg <- read_delim('data/Palma-Guerrero_combined_data.txt',delim='\t')
+
+#Put it into long format and extract the variables.
+data_pg <- data_pg%>%melt(id='gene_id')%>%mutate(strain=sapply(as.character(variable),function(x)strsplit(x,'-')[[1]][1]),
+                                               replicate=sapply(as.character(variable),function(x)strsplit(x,'-')[[1]][2]),
+                                               time=sapply(as.character(variable),function(x)strsplit(x,'-')[[1]][3]))
+
+#Names of the Palma-Guerrero strains.
+pg_strains <- unique(data_pg$strain)
+
+#Names of the Palma-Guerrero genes.
+pg_genes <- unique(data_pg$gene_id)
+
+#Combine the Haueisen and Palma-Guerrero data, retaining only the intersection of genes.
+data_merged <- rbind(data_hau,data_pg)%>%filter(gene_id%in%intersect(hau_genes,pg_genes))
+
+#Names of all the available strains.
+strains <- unique(data_merged$strain)
+
+#Names of the genes in the intersection of both data sets.
+genes <- unique(data_merged$gene_id)
+
+#The number of strains.
+n_strains <- length(strains)
+
+#The number of genes.
+n_genes <- length(genes)
+```
+
+### Gene selection using a random forest classifier.
+
+```{r}
+#Extract the data for the first and third time points.
+class_data <- filter(data_merged,time%in%c('A','7d','C','14d'))
+
+#Define the binary quantity (output) 'stage'.
+class_data$stage <- NA
+class_data$stage[class_data$time%in%c('A','7d')] <- 0
+class_data$stage[class_data$time%in%c('C','14d')] <- 1
+
+#Put the data into wide format (genes are covariates/inputs).
+class_data <- class_data%>%pivot_wider(id_cols=c('variable','stage'),
+                                       names_from='gene_id',values_from='value')%>%
+  select(-variable)
+
+#Fit the random forest classifier.
+classifier <- ranger(stage~.,importance = 'impurity',data=class_data,num.trees = 100000,splitrule = 'extratrees')
+
+#Extract the indices of the most important genes in decreasing order of importance.
+importance_values <- classifier$variable.importance
+importance_ranks <- sort(importance_values,decreasing = TRUE,index.return=TRUE)$ix
+```
+
+### Calculate the Mahalanobis distances and fit the model for different values of K.
+
+```{r}
+#Sequence of values to try for K (refers to the K most important genes).
+K_list <- c(5,10,15,20)
+
+#Pre-define some lists to store data in.
+important_features_1 <- mah_fit_data_1 <- mah_ests_1 <- distance_data_1 <- model_data_1 <- 
+  fung_samples_1 <- list()
+```
+
+```{r message=FALSE, warning=FALSE}
+for(i in 1:length(K_list)){
+  # Extract the K most important genes.
+  important_features_1[[i]] <- genes[importance_ranks[1:K_list[i]]]
+  # Filter the complete data retaining only the most important genes and put into wide format.
+  mah_fit_data_1[[i]] <- filter(data_merged,gene_id%in%important_features_1[[i]],time%in%c('A','7d'))%>%
+  pivot_wider(id_cols=c('variable'),names_from ='gene_id',values_from ='value')%>%select(-variable)
+  
+  # Calculate the input mean and empirical covariance for the Mahalanobis distance.
+  mah_ests_1[[i]] <- mvnorm.mle(as.matrix(mah_fit_data_1[[i]]))
+  
+  # Filter the complete data retaining only the most important genes and put into wide format.
+  distance_data_1[[i]] <- filter(data_merged,gene_id%in%important_features_1[[i]])%>%
+    pivot_wider(id_cols=c('variable','strain','replicate','time'),
+                names_from ='gene_id',values_from ='value')
+  # Compute the Mahalanobis distances.
+  distance_data_1[[i]] <- distance_data_1[[i]]%>%mutate(distance=sqrt(mahalanobis(select(distance_data_1[[i]],-variable,-strain,-replicate,-time),
+                                                                    center=mah_ests_1[[i]]$mu,cov=pseudoinverse(mah_ests_1[[i]]$sigma),inverted = TRUE)))
+  # Add the times for the Haueisen experiment.
+  distance_data_1[[i]] <- distance_data_1[[i]]%>%left_join(hau_times)
+  distance_data_1[[i]]$real_times[is.na(distance_data_1[[i]]$real_times)] <- 
+    as.numeric(sapply(distance_data_1[[i]]$time[is.na(distance_data_1[[i]]$real_times)],function(x)substr(x,1,nchar(x)-1)))
+  
+  # Identify the strains known 'a-priori' to be 'early' and 'late onset (for plotting only).
+  distance_data_1[[i]]$type <- 'early'
+  distance_data_1[[i]]$type[distance_data_1[[i]]$strain%in%c('3D1','Zt10')]='late'
+  
+  # Join the distances data with the outcomes data (not used in the end) for modelling.
+  model_data_1[[i]] <- distance_data_1[[i]]%>%left_join(outcomes_data)%>%mutate(K=K_list[[i]])
+  
+  # Number of observations for modelling.
+  n=dim(model_data_1[[i]])
+  
+  # Start defining the Bayesian model using the NIMBLE package.
+  
+  # Constants are things that don't change and aren't random variables like scalars, covariates.
+  fung_constants_1 <- list(n_strains=n_strains,n=n,time=model_data_1[[i]]$real_times,
+                         strain=as.numeric(factor(model_data_1[[i]]$strain,levels=strains)))
+  
+  # Data is things like variables.
+  fung_data_1 <- list(d=log(model_data_1[[i]]$distance))
+  
+  # Define the model object.
+  fung_model_1 <- nimbleModel(fung_code,fung_constants_1,fung_data_1,fung_inits_fun())
+  # Compile the model.
+  fung_compiled_model_1 <- compileNimble(fung_model_1)
+  # Configure the MCMC (e.g. which parameters to save).
+  fung_mcmc_config_1 <- configureMCMC(fung_model_1,monitors=c('mu','iota','kappa','alpha','sigma'))
+  # Build the MCMC.
+  fung_mcmc_1 <- buildMCMC(fung_mcmc_config_1)
+  # Compile the MCMC.
+  fung_compiled_mcmc_1 <- compileNimble(fung_mcmc_1)
+  
+  # Run the MCMC.
+  fung_samples_1[[i]] <- runMCMC(fung_compiled_mcmc_1,niter=40000,nburnin = 20000,nchains=4,thin=2,
+                          samplesAsCodaMCMC = TRUE,inits=fung_inits_fun)
+  
+}
+```
+
+```{r}
+#Check convergence of MCMC chains with the potential scale reduction factor.
+lapply(fung_samples_1,function(x)quantile(gelman.diag(x,multivariate = FALSE,autoburnin = FALSE,
+                                                      transform=FALSE)$psrf,c(0.5,0.9,0.95,1),na.rm=T))
+
+#Combine the samples from the 4 chains and merge the different values of K.
+fung_combined_samples_1 <- lapply(fung_samples_1,function(x)do.call('rbind',x))
+
+#Number of MCMC samples (total across the 4 chains).
+n_sim_1 <- dim(fung_combined_samples_1[[1]])[1]
+
+#Extract the values of the piecewise linear functions.
+m_1 <- lapply(fung_combined_samples_1,function(x){x%>%as.data.frame()%>%select(starts_with('mu['))%>%unlist()%>%
+  array(dim=c(n_sim_1,28,n_strains))})%>%abind(along=4)
+
+#Add the strain names as names for the third dimension.
+dimnames(m_1)[[3]] <- strains
+
+#Add the K values as names for the last dimension.
+dimnames(m_1)[[4]] <- K_list
+
+#Calculate the 2.5%, 50% and 97.5% quantiles of the piecewise linear functions.
+m_quantiles_1 <- apply(m_1,c(2,3,4),quantile,c(0.025,0.5,0.975))
+
+#Convert into a data frame.
+m_quantiles_data_1 <- m_quantiles_1%>%melt(varnames=c('quantile','t','strain','K'),value.name='distance')%>%
+  spread(quantile,distance)
+m_quantiles_data_1$type='early'
+m_quantiles_data_1$type[m_quantiles_data_1$strain%in%c('3D1','Zt10')]='late'
+```
+
+Plot the distances for K=10.
+
+```{r}
+distance_plot <- ggplot(mutate(distance_data_1[[which(K_list==10)]],strain=factor(strain,levels=strains)),aes(x=real_times,y=log(distance),colour=strain,linetype=type))+
+  geom_point()+
+  theme_minimal()+
+  scale_color_brewer(name='Strain',palette='Dark2')+
+  labs(x='Days post infection',y='log( Mahalanobis Distance )')
+distance_plot
+```
+
+Plot the model fit for K=10.
+
+```{r warning=FALSE}
+fit_plot <- ggplot()+
+  geom_ribbon(data=filter(m_quantiles_data_1,K==10),aes(x=t,ymin=`2.5%`,ymax=`97.5%`,fill=strain),alpha=0.1)+
+  geom_line(data=filter(m_quantiles_data_1,K==10),aes(x=t,y=`50%`,colour=strain,linetype=type))+
+  geom_point(data=model_data_1[[which(K_list==10)]],aes(x=real_times,y=log(distance),colour=strain))+
+  scale_color_brewer(name='Strain',palette='Dark2')+
+  scale_fill_brewer(name='Strain',palette='Dark2')+
+  labs(x='Days post infection',y='log( Mahalanobis distance )')+
+  scale_linetype(name='Onset')+
+  theme_minimal()+
+  theme(strip.text = element_text(size=12))
+fit_plot
+```
+
+Plot the model for the sequence of K values.
+
+```{r}
+fit_plot_K <- ggplot()+
+  geom_ribbon(data=m_quantiles_data_1,aes(x=t,ymin=`2.5%`,ymax=`97.5%`,fill=strain),alpha=0.1)+
+  geom_line(data=m_quantiles_data_1,aes(x=t,y=`50%`,colour=strain,linetype=type))+
+  geom_point(data=do.call('rbind',lapply(model_data_1,function(x)select(x,real_times,distance,strain,K))),aes(x=real_times,y=log(distance),colour=strain))+
+  facet_wrap(~factor(paste('K=',K,sep=''),levels=paste('K=',K_list,sep='')))+
+  scale_color_brewer(name='Strain',palette='Dark2')+
+  scale_fill_brewer(name='Strain',palette='Dark2')+
+  labs(x='Days post infection',y='log( Mahalanobis distance )')+
+  scale_linetype(name='Onset')+
+  theme_minimal()+
+  theme(strip.text = element_text(size=12))
+fit_plot_K
+```
+
+
+Extra the values for the knot timings.
+
+```{r}
+kappa_1 <- lapply(fung_combined_samples_1,function(x){x%>%as.data.frame()%>%select(starts_with('kappa['))%>%unlist()%>%
+    array(dim=c(n_sim_1,4,n_strains))})%>%abind(along=4)
+dimnames(kappa_1)[[3]] <- strains
+dimnames(kappa_1)[[4]] <- K_list
+
+#Convert into a data frame and put into long format.
+kappa_data_1 <- kappa_1%>%melt(varnames=c('sample','knot','strain','K'))
+
+kappa_data_1 <- kappa_data_1%>%left_join(outcomes_data)
+kappa_data_1$type='early'
+kappa_data_1$type[kappa_data_1$strain%in%c('3D1','Zt10')]='late'
+kappa_data_1$strain=factor(kappa_data_1$strain,levels=strains)
+```
+
+Plot the posteriors for the peak timing for K=10.
+
+```{r}
+knot_plot <- ggplot(filter(kappa_data_1,knot==3,K==10),aes(x=value,colour=strain,linetype=type))+
+  geom_density(fill=NA,trim=TRUE,adjust=2)+
+  scale_colour_brewer(name='Strain',palette='Dark2')+
+  scale_linetype(name='Onset')+labs(x='Time of peak distance (days)',y='Posterior density')+
+  theme_minimal()+coord_cartesian()
+knot_plot
+```
+
+Plot the posteriors for the timing of the peak distance for the sequence of K values.
+
+```{r}
+knot_plot_K <- ggplot(filter(kappa_data_1,knot==3),aes(x=value,colour=strain,linetype=type))+
+  geom_density(fill=NA,trim=TRUE,adjust=2)+
+  scale_colour_brewer(name='Strain',palette='Dark2')+
+  scale_linetype(name='Onset')+labs(x='Time of peak distance (days)',y='Posterior density')+
+  theme_minimal()+coord_cartesian()+
+  facet_wrap(~factor(paste('K=',K,sep=''),levels=paste('K=',K_list,sep='')))+
+  theme(strip.text = element_text(size=12))
+knot_plot_K
+```
+
+Write the top 20 most important genes. **NB** that the importance scores, and very occassionally the ranks, of these genes may vary from the accompanying paper due to stochasticity in the random forest classifier. 
+
+```{r warning=FALSE}
+importance_data_1 <- data.frame(Rank=1:n_genes,Gene=genes[importance_ranks],Importance=round(importance_values[importance_ranks],3))
+head(importance_data_1)
+```
+
+### Leave one out analysis
+
+```{r message=FALSE}
+#Pre-define some lists to store things in.
+model_data_2 <- fung_combined_samples_2 <- fung_samples_2 <- importance_ranks_2 <- importance_2 <- important_features_2 <- list()
+
+#Loop over the 7 strains, leaving one out each time.
+for(s in 1:n_strains){
+  # Identify the strain to treat as unseen.
+  removed_strain <- strains[s]
+  # Filter out the unseen strain for classification.
+  class_data_2 <- filter(data_merged,time%in%c('A','7d','C','14d'),strain!=removed_strain)
+  # Proceed with the same data preparation as before.
+  class_data_2$stage <- NA
+  class_data_2$stage[class_data_2$time%in%c('A','7d')] <- 0
+  class_data_2$stage[class_data_2$time%in%c('C','14d')] <- 1
+  
+  class_data_2 <- class_data_2%>%pivot_wider(id_cols=c('variable','stage'),
+                                         names_from='gene_id',values_from='value')%>%
+    select(-variable)
+  
+  # Fit the classifier.
+  classifier_2 <- ranger(stage~.,importance = 'impurity',data=class_data_2,num.trees = 100000,splitrule = 'extratrees')
+  
+  # Use a value of 10 for K.
+  K=10
+  
+  # Save information about gene importance.
+  importance_2[[s]] <- classifier_2$variable.importance
+  importance_ranks_2[[s]] <- sort(importance_2[[s]],decreasing = TRUE,index.return=TRUE)$ix
+  important_features_2[[s]] <- genes[importance_ranks_2[[s]][1:K]] 
+  
+  # Continue to leave out the unseen strain for calculating the inputs to the Mahalanobis distance.
+  mah_fit_data_2 <- filter(data_merged,gene_id%in%important_features_2[[s]],time%in%c('A','7d'),strain!=removed_strain)%>%
+    pivot_wider(id_cols=c('variable'),names_from ='gene_id',values_from ='value')%>%select(-variable)
+  
+  mah_ests_2 <- mvnorm.mle(as.matrix(mah_fit_data_2))
+  
+  # Now compute the distance for all of the strains.
+  distance_data_2 <- filter(data_merged,gene_id%in%important_features_2[[s]])%>%
+    pivot_wider(id_cols=c('variable','strain','replicate','time'),
+                names_from ='gene_id',values_from ='value')
+  distance_data_2 <- distance_data_2%>%mutate(distance=sqrt(mahalanobis(select(distance_data_2,-variable,-strain,-replicate,-time),
+                                                                    center=mah_ests_2$mu,cov=pseudoinverse(mah_ests_2$sigma),inverted = TRUE)))
+  distance_data_2 <- distance_data_2%>%left_join(hau_times)
+  distance_data_2$real_times[is.na(distance_data_2$real_times)] <- as.numeric(sapply(distance_data_2$time[is.na(distance_data_2$real_times)],function(x)substr(x,1,nchar(x)-1)))
+  distance_data_2$type <- 'early'
+  distance_data_2$type[distance_data_2$strain%in%c('3D1','Zt10')]='late'
+  
+  # Now run the model (same as before).
+  model_data_2[[s]] <- distance_data_2%>%left_join(outcomes_data)
+  # Number of observations for the model.
+  n <- dim(model_data_2[[s]])[1]
+  
+  fung_constants_2 <- list(n_strains=n_strains,n=n,time=model_data_2[[s]]$real_times,
+                         strain=as.numeric(factor(model_data_2[[s]]$strain,levels=strains)))
+  
+  fung_data_2 <- list(d=log(model_data_2[[s]]$distance))
+  
+  fung_model_2 <- nimbleModel(fung_code,fung_constants_2,fung_data_2,fung_inits_fun())
+  
+  fung_compiled_model_2 <- compileNimble(fung_model_2)
+  
+  fung_mcmc_config_2 <- configureMCMC(fung_model_2,monitors=c('mu','iota','kappa','alpha','sigma'))
+  fung_mcmc_2 <- buildMCMC(fung_mcmc_config_2)
+  fung_compiled_mcmc_2 <- compileNimble(fung_mcmc_2)
+  
+  fung_samples_2[[s]] <- runMCMC(fung_compiled_mcmc_2,niter=40000,nburnin = 20000,nchains=4,thin=2,
+                          samplesAsCodaMCMC = TRUE,inits=fung_inits_fun)
+  fung_combined_samples_2[[s]] <- do.call('rbind',fung_samples_2[[s]])
+  n_sim_2 <- dim(fung_combined_samples_2[[s]])[1]
+}
+```
+
+```{r}
+# Check convergence of MCMC chains with the potential scale reduction factor.
+lapply(fung_samples_2,function(x)quantile(gelman.diag(x,multivariate = FALSE,autoburnin = FALSE,
+                                                      transform=FALSE)$psrf,c(0.5,0.9,0.95,1),na.rm=T))
+
+# Count how many times each gene was in the top K.
+importance_set <- do.call('c',important_features_2)
+sort(table(importance_set),decreasing = TRUE)
+
+# Matrix containing the indices of the most important genes in decreasing order.
+importance_matrix <- do.call('cbind',importance_ranks_2)
+
+# Matrix which tells you which rank each gene is in each model run.
+rank_matrix <- matrix(nrow=n_genes,ncol=n_strains)
+for(j in 1:n_strains){
+  for(i in 1:n_genes){
+    rank_matrix[i,j] <- which(importance_matrix[,j]==i)
+  }
+}
+# Indices of the most important genes in order of median rank across the 7 runs.
+median_ranks <- sort(apply(rank_matrix,1,median),index.return=TRUE)$ix
+
+# Write out the median, mean, lowest and highest ranks.
+importance_data_2 <- data.frame(Median.Rank=sort(apply(rank_matrix,1,median)),
+                                Gene=genes[median_ranks],
+                                Lowest.Rank=apply(rank_matrix,1,min)[median_ranks],
+                                Mean.Rank=round(apply(rank_matrix,1,mean)[median_ranks]),
+                                Highest.Rank=apply(rank_matrix,1,max)[median_ranks])
+#write.csv(importance_data_2[1:20,],'Paper/importance_2.csv',
+#          row.names = FALSE,quote=FALSE)
+
+# Extract samples of the piecewise linear functions for each strain.
+mu_2 <- abind(lapply(fung_combined_samples_2,function(x){x%>%as.data.frame()%>%select(starts_with('mu['))%>%unlist()%>%
+  array(dim=c(n_sim_2,28,n_strains))}),along=4)
+
+# Calculate the 2.5%, 50% and 97.5% quantiles.
+mu_quantiles_2 <- apply(mu_2,c(2,3,4),quantile,c(0.025,0.5,0.975))
+# Name the dimension for the strain corresponding to each function.
+dimnames(mu_quantiles_2)[[3]] <- strains
+# Name the dimension for the strain which was treated as unseen.
+dimnames(mu_quantiles_2)[[4]] <- strains
+
+# Convert to a data frame and put it into long format.
+mu_quantiles_data_2 <- mu_quantiles_2%>%melt(varnames=c('quantile','t','strain','removed'),value.name='distance')%>%
+  spread(quantile,distance)
+mu_quantiles_data_2$type='early'
+mu_quantiles_data_2$type[mu_quantiles_data_2$strain%in%c('3D1','Zt10')]='late'
+
+# Add a label for which strain was unseen to the input data.
+for(s in 1:n_strains){
+  model_data_2[[s]]$removed <- strains[s]
+}
+# Combine all of this data for plotting.
+all_model_data_2 <- do.call('rbind',lapply(model_data_2,function(x)select(x,strain,real_times,distance,removed)))
+```
+
+Plot all of the 7 model fits.
+
+```{r}
+model_plot <- ggplot()+
+  geom_ribbon(data=mu_quantiles_data_2,aes(x=t,ymin=`2.5%`,ymax=`97.5%`,fill=strain),alpha=0.1)+
+  geom_line(data=mu_quantiles_data_2,aes(x=t,y=`50%`,colour=strain,linetype=type))+
+  geom_point(data=all_model_data_2,aes(x=real_times,y=log(distance),colour=strain),alpha=1)+
+  scale_color_brewer(name='Strain',palette='Dark2')+
+  scale_fill_brewer(name='Strain',palette='Dark2')+
+  labs(x='Days post infection',y='log( Mahalanobis distance )')+
+  scale_linetype(name='Onset')+
+  facet_wrap(~removed)+
+  theme_minimal()+
+  theme(strip.text = element_text(size=12))
+model_plot
+```
+
+Plot the model fits for only the unseen strains.
+
+```{r}
+removed_plot <- ggplot()+
+  geom_ribbon(data=filter(mu_quantiles_data_2,strain==removed),aes(x=t,ymin=`2.5%`,ymax=`97.5%`,fill=strain),alpha=0.1)+
+  geom_line(data=filter(mu_quantiles_data_2,strain==removed),aes(x=t,y=`50%`,colour=strain,linetype=type))+
+  geom_point(data=filter(all_model_data_2,strain==removed),aes(x=real_times,y=log(distance),colour=strain),alpha=1)+
+  scale_color_brewer(name='Strain',palette='Dark2')+
+  scale_fill_brewer(name='Strain',palette='Dark2')+
+  labs(x='Days post infection',y='log( Mahalanobis distance )',
+       title='Unseen with all four time points used')+
+  scale_linetype(name='Onset')+
+  theme_minimal()
+removed_plot
+```
+
+```{r}
+# Extract the samples for the timing of the knots.
+kappa_2 <- abind(lapply(fung_combined_samples_2,function(x){x%>%as.data.frame()%>%select(starts_with('kappa['))%>%unlist()%>%
+  array(dim=c(n_sim_2,4,n_strains))}),along=4)
+# Name the 3rd and 4th dimensions as before.
+dimnames(kappa_2)[[3]] <- strains
+dimnames(kappa_2)[[4]] <- strains
+
+# Convert to a data frame and put into long format.
+kappa_data_2 <- kappa_2%>%melt(varnames=c('sample','knot','strain','removed'))
+kappa_data_2$type='early'
+kappa_data_2$type[kappa_data_2$strain%in%c('3D1','Zt10')]='late'
+kappa_data_2$strain=factor(kappa_data_2$strain,levels=strains)
+```
+
+Plot the distributions of the timing of the peak distance.
+
+```{r}
+knot_removed <- ggplot(filter(kappa_data_2,knot==3,strain==removed),aes(x=value,colour=strain,linetype=type))+
+  geom_density(fill=NA,trim=TRUE,adjust=2)+
+  scale_colour_brewer(name='Strain',palette='Dark2')+
+  scale_linetype(name='Onset')+labs(x='Time of third knot (days)',y='Density')+
+  theme_minimal()+coord_cartesian(xlim=c(0,28))
+knot_removed
+```
+
+### Run the lesve one out experiment where only the first two time points are used
+```{r}
+fung_samples_3 <- fung_combined_samples_3 <-  list()
+for(s in 1:n_strains){
+  # Set up the model data as before.
+  fung_constants_3 <- list(n_strains=n_strains,n=n,time=model_data_2[[s]]$real_times,
+                         strain=as.numeric(factor(model_data_2[[s]]$strain,levels=strains)))
+  
+  fung_data_3 <- list(d=log(model_data_2[[s]]$distance))
+  # Identify the second time point of the unseen strain.
+  second_time <- sort(unique(fung_constants_3$time[fung_constants_3$strain==s]))[2]
+  # Treat time points after the second time as missing values.
+  fung_data_3$d[fung_constants_3$strain==s&fung_constants_3$time>second_time] <- NA
+  
+  fung_model_3 <- nimbleModel(fung_code,fung_constants_3,fung_data_3,fung_inits_fun())
+
+  fung_compiled_model_3 <- compileNimble(fung_model_3)
+  # This time we are going to monitor the missing distance values.
+  fung_mcmc_config_3 <- configureMCMC(fung_model_3,monitors=c('mu','iota','kappa','alpha','sigma','d'))
+  fung_mcmc_3 <- buildMCMC(fung_mcmc_config_3)
+  fung_compiled_mcmc_3 <- compileNimble(fung_mcmc_3)
+  
+  fung_samples_3[[s]] <- runMCMC(fung_compiled_mcmc_3,niter=40000,nburnin = 20000,nchains=4,thin=2,
+                               samplesAsCodaMCMC = TRUE,inits=fung_inits_fun)
+  fung_combined_samples_3[[s]] <- do.call('rbind',fung_samples_3[[s]])
+  n_sim_3 <- dim(fung_combined_samples_3[[s]])[1]
+}
+
+# Check convergence of MCMC chains with the potential scale reduction factor.
+lapply(fung_samples_3,function(x)quantile(gelman.diag(x,multivariate = FALSE,autoburnin = FALSE,
+                                                      transform=FALSE)$psrf,c(0.5,0.9,0.95,1),na.rm=T))
+
+# Extract the values of the piecewise linear functions for each strain.
+mu_3 <- abind(lapply(fung_combined_samples_3,function(x){x%>%as.data.frame()%>%select(starts_with('mu['))%>%unlist()%>%
+    array(dim=c(n_sim_3,28,n_strains))}),along=4)
+
+# Calculate the 2.5%, 50% and 97.5% quantiles.
+mu_quantiles_3 <- apply(mu_3,c(2,3,4),quantile,c(0.025,0.5,0.975))
+# Name the 3rd and 4th dimensions.
+dimnames(mu_quantiles_3)[[3]] <- strains
+dimnames(mu_quantiles_3)[[4]] <- strains
+
+# Convert to a data frame and put it into long format.
+mu_quantiles_data_3 <- mu_quantiles_3%>%melt(varnames=c('quantile','t','strain','removed'),value.name='distance')%>%
+  spread(quantile,distance)
+mu_quantiles_data_3$type='early'
+mu_quantiles_data_3$type[mu_quantiles_data_3$strain%in%c('3D1','Zt10')]='late'
+```
+
+Plot the model fit for the unseen strains.
+
+```{r}
+slope_plot <- ggplot()+
+  geom_ribbon(data=filter(mu_quantiles_data_3,strain==removed),aes(x=t,ymin=`2.5%`,ymax=`97.5%`,fill=strain),alpha=0.1)+
+  geom_line(data=filter(mu_quantiles_data_3,strain==removed),aes(x=t,y=`50%`,colour=strain,linetype=type))+
+  geom_point(data=filter(all_model_data_2,strain==removed),aes(x=real_times,y=log(distance),colour=strain),alpha=0.5)+
+  scale_color_brewer(name='Strain',palette='Dark2')+
+  scale_fill_brewer(name='Strain',palette='Dark2')+
+  labs(x='Time (days)',y='log( Mahalanobis distance )',title='Unseen strains with just the\nfirst two time points used')+
+  scale_linetype(name='Onset')+
+  theme_minimal()
+slope_plot
+```
+
+```{r}
+# Extract the samples for the timing of the knots.
+kappa_3 <- abind(lapply(fung_combined_samples_3,function(x){x%>%as.data.frame()%>%select(starts_with('kappa['))%>%unlist()%>%
+    array(dim=c(n_sim_3,4,n_strains))}),along=4)
+# Name the 3rd and 4th dimensions.
+dimnames(kappa_3)[[3]] <- strains
+dimnames(kappa_3)[[4]] <- strains
+
+# Convert to a data frame and put it into long format.
+kappa_data_3 <- kappa_3%>%melt(varnames=c('sample','knot','strain','removed'))
+kappa_data_3$type='early'
+kappa_data_3$type[kappa_data_3$strain%in%c('3D1','Zt10')]='late'
+kappa_data_3$strain=factor(kappa_data_3$strain,levels=strains)
+```
+
+Plot the posterior distributions for the timing of the knots for the unseen strains.
+
+```{r}
+knot_slope_plot <- ggplot(filter(kappa_data_3,knot==3,strain==removed),aes(x=value,colour=strain,linetype=type))+
+  geom_density(fill=NA,trim=TRUE,adjust=2)+
+  scale_colour_brewer(name='Strain',palette='Dark2')+
+  scale_linetype(name='Onset')+labs(x='Time of third knot (days)',y='Density')+
+  theme_minimal()+coord_cartesian(xlim=c(0,28))
+knot_slope_plot
+```
+
+```{r}
+# Extract the samples for the distances (includes both observed values and samples for now).
+d_3 <- abind(lapply(fung_combined_samples_3,function(x){x%>%as.data.frame()%>%select(starts_with('d['))%>%unlist()%>%
+    array(dim=c(n_sim_3,n))}),along=3)
+# Name the 3rd dimensions.
+dimnames(d_3)[[3]] <- strains
+
+# Convert to a data frame and put it into long format.
+d_quantiles_3 <- apply(d_3,c(2,3),quantile,c(0.025,0.25,0.5,0.75,0.975))
+  
+d_quantiles_data_3 <- d_quantiles_3%>%melt(varnames=c('quantile','obs','removed'))%>%
+  mutate(strain=distance_data_1[[1]]$strain[obs],time=distance_data_1[[1]]$time[obs],
+         replicate=distance_data_1[[1]]$replicate[obs])%>%
+  left_join(do.call('rbind',lapply(model_data_2,function(x)select(x,strain,replicate,time,real_times,removed,distance))))%>%
+  spread(quantile,value)
+
+d_quantiles_data_3$time_point <- NA
+d_quantiles_data_3$time_point[which(d_quantiles_data_3$time%in%c('A','7d'))] <- 1
+d_quantiles_data_3$time_point[which(d_quantiles_data_3$time%in%c('B','12d'))] <- 2
+d_quantiles_data_3$time_point[which(d_quantiles_data_3$time%in%c('C','14d'))] <- 3
+d_quantiles_data_3$time_point[which(d_quantiles_data_3$time%in%c('D','28d'))] <- 4
+```
+
+Plot the prediction of the unseen timepoints
+
+```{r}
+pred_plot <- ggplot(filter(d_quantiles_data_3,removed==strain,time_point%in%c(3,4)))+
+  geom_abline(intercept = 0,slope=1)+
+  geom_errorbar(aes(x=log(distance),ymin=`2.5%`,ymax=`97.5%`,colour=strain))+
+  geom_point(aes(x=log(distance),y=`50%`,colour=strain))+
+  facet_wrap(~sapply(time_point,function(x)ifelse(x==3,'3rd time point','4th time point')))+
+  scale_color_brewer(name='Strain',palette='Dark2')+
+  scale_fill_brewer(name='Strain',palette='Dark2')+
+  labs(x='Observed distance',y='Predicted distance',
+       title='Prediction of unseen time points')+
+  theme_minimal()+theme(strip.text=element_text(size=12))
+pred_plot
+```
+
+Calculate statistics about the error of predictions and the variability explained by our predictions
+
+```{r}
+# Calculate the average error of predictions.
+d_quantiles_data_3%>%filter(time_point==3,removed==strain)%>%summarise(bias=mean(log(distance)-`50%`))
+d_quantiles_data_3%>%filter(time_point==4,removed==strain)%>%summarise(bias=mean(log(distance)-`50%`))
+
+# Calculate the average absolute error of predictions.
+d_quantiles_data_3%>%filter(time_point==3,removed==strain)%>%summarise(accuracy=mean(abs(log(distance)-`50%`)))
+d_quantiles_data_3%>%filter(time_point==4,removed==strain)%>%summarise(accuracy=mean(abs(log(distance)-`50%`)))
+mean(do.call('rbind',fung_samples_1[[2]])[,'sigma'])
+
+# Calculate the average absolute error of predictions.
+d_quantiles_data_3%>%filter(time_point==3,removed==strain)%>%summarise(coverage_95=mean(log(distance)>=`2.5%`&log(distance<=`97.5%`)))
+d_quantiles_data_3%>%filter(time_point==4,removed==strain)%>%summarise(coverage_95=mean(log(distance)>=`2.5%`&log(distance<=`97.5%`)))
+
+# Percentage of variability explained by predictions
+1-d_quantiles_data_3%>%filter(time_point==3,removed==strain)%>%summarise(R=var(log(distance)-`50%`)/var(log(distance)))
+1-d_quantiles_data_3%>%filter(time_point==4,removed==strain)%>%summarise(R=var(log(distance)-`50%`)/var(log(distance)))
+```
